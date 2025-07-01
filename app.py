@@ -1,7 +1,7 @@
-# app.py (Main Streamlit Application File)
-
 import streamlit as st
 import google.generativeai as gemini
+from mistralai import Mistral
+from groq import Groq
 from typing import Optional, List, Tuple
 import concurrent.futures
 import re, random
@@ -9,73 +9,64 @@ import ast
 import json
 from pydantic import BaseModel, TypeAdapter
 from collections import defaultdict
-import os
-from dotenv import load_dotenv # Used for loading environment variables
-
-# --- Configuration and Initialization ---
-# Load environment variables from .env file
-# This should be at the very top of your main application file.
-load_dotenv()
 
 # ====== Client Initialization ======
-# Gemini API configuration. The API key will be automatically provided by the environment.
 try:
-    # Retrieve API key from environment variables
-    # It's crucial to set GEMINI_API_KEY in your .env file
-    gemini_api_key = os.getenv("GEMINI_API_KEY")
-    if not gemini_api_key:
-        st.error("GEMINI_API_KEY not found in environment variables. Please set it in your .env file.")
-        st.stop() # Stop the app if API key is missing
+    # Attempt to retrieve API keys from Streamlit secrets
+    groq_api_key = st.secrets["GROQ_API_KEY"]
+    mistral_api_key = st.secrets["MISTRAL_API_KEY"]
+    gemini_api_key = st.secrets["GEMINI_API_KEY"]
 
-    gemini.configure(api_key=gemini_api_key)
-except Exception as e:
-    st.error(f"Gemini API initialization error: {e}")
+    groq_client = Groq(api_key=groq_api_key)
+    mistral_client = Mistral(api_key=mistral_api_key)
+    gemini.configure(api_key=gemini_api_key) # Configure Gemini globally
+
+except KeyError as e:
+    st.error(f"Missing API key in Streamlit secrets: {e}. Please ensure GROQ_API_KEY, MISTRAL_API_KEY, and GEMINI_API_KEY are set.")
     st.stop() # Stop the app if initialization fails
+except Exception as e:
+    st.error(f"Initialization error: {e}")
+    st.stop()
 
-# --- api_wrappers.py (Separate file for API interaction) ---
-
-def call_gemini(prompt: str, model: str = "gemini-2.0-flash") -> Optional[str]:
-    """
-    Calls the Gemini API with a given prompt and model name.
-
-    Args:
-        prompt (str): The text prompt to send to the Gemini model.
-        model (str): The name of the Gemini model to use (default: "gemini-2.0-flash").
-
-    Returns:
-        Optional[str]: The generated text response from the model, or None if an error occurs.
-    """
+# ====== API Wrappers ======
+def call_gemini(prompt: str, model: str = "gemini-1.5-flash") -> Optional[str]:
+    """Call Gemini API with prompt and model name"""
     try:
         model_instance = gemini.GenerativeModel(model)
         response = model_instance.generate_content(prompt)
-        # Check if response.text exists and is not empty before stripping
         return response.text.strip() if response.text else None
     except Exception as e:
-        st.error(f"Gemini API call error: {e}")
+        st.error(f"Gemini error with model {model}: {e}")
         return None
 
-# --- utils.py (Separate file for utility functions and Pydantic models) ---
+def call_mistral(prompt: str, model: str = "open-mistral-7b") -> Optional[str]:
+    """Call Mistral API with prompt and model name"""
+    try:
+        response = mistral_client.chat.complete(
+            model=model,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.choices[0].message.content.strip() if response.choices else None
+    except Exception as e:
+        st.error(f"Mistral error with model {model}: {e}")
+        return None
 
-class MCQs(BaseModel):
-    """Pydantic model for a single Multiple Choice Question."""
-    category: str
-    question: str
-    options: List[str]
-    correct_option: str
+def call_groq(prompt: str, model: str = "mixtral-8x7b-32768") -> Optional[str]:
+    """Call Groq API with prompt and model name"""
+    try:
+        response = groq_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.choices[0].message.content.strip() if response.choices else None
+    except Exception as e:
+        st.error(f"Groq error with model {model}: {e}")
+        return None
 
-def merge_results(input_strings: List[str]) -> str:
-    """
-    Merges a list of CSV-like strings, typically from verification steps.
-    If all corresponding values for a key are "1", the output for that key is "1".
-    Otherwise, it's "0".
-
-    Args:
-        input_strings (List[str]): A list of strings, each representing CSV-like data
-                                    (e.g., '"1","1"\n"2","0"').
-
-    Returns:
-        str: A merged CSV-like string where each key's value is "1" only if all
-             corresponding input values were "1".
+# Helper functions from original script (no changes needed here based on the request)
+def merge_results(input_strings):
+    """Merges a list of CSV-like strings, outputting a merged string.
+    If all corresponding values are "1", the output is "1". Otherwise, it's "0".
     """
     data_dicts = []
     for s in input_strings:
@@ -86,8 +77,8 @@ def merge_results(input_strings: List[str]) -> str:
             if match:
                 key, value = match.groups()
                 data[key] = value
-            # else:
-                # print(f"Skipping malformed line in merge_results: {line}") # Debugging
+            else:
+                continue
         data_dicts.append(data)
 
     merged_data = {}
@@ -106,43 +97,22 @@ def merge_results(input_strings: List[str]) -> str:
         output_string += f'"{key}","{merged_data[key]}"\n'
     return output_string.strip()
 
-def parse_qa(input_string: str) -> List[List[str]]:
-    """
-    Parses a string of question-answer pairs into a numbered list of lists.
-    Expected input format: '"Question text","Answer text"\n"Q2","A2"'
-
-    Args:
-        input_string (str): A string containing QA pairs.
-
-    Returns:
-        List[List[str]]: A list where each inner list contains
-                         [QA_Number_as_String, Question_String, Answer_String].
-    """
+def parse_qa(input_string):
+    """Parses a string of question-answer pairs into a numbered list."""
     qa_pairs = input_string.strip().split('\n')
     output = []
 
     for i, pair in enumerate(qa_pairs):
-        # Split by '","' to handle quoted strings correctly
         parts = re.split(r'",\s*"', pair.strip('"'))
         if len(parts) == 2:
             question, answer = parts
             output.append([f'''"{i+1}"''', f'''"{question}"''', f'''"{answer}"'''])
-        # else:
-            # print(f"Skipping malformed QA pair in parse_qa: {pair}") # Debugging
+        else:
+            continue
     return output
 
-def remove_zero_entries(parsed_data: List[List[str]], zero_values_data: List[str]) -> List[List[str]]:
-    """
-    Removes entries from parsed_data based on '0' values in zero_values_data.
-    'zero_values_data' typically comes from the verification step.
-
-    Args:
-        parsed_data (List[List[str]]): List of QA pairs (e.g., [['"1"', '"Q1"', '"A1"']]).
-        zero_values_data (List[str]): List of verification results (e.g., ['"1","1"\n"2","0"']).
-
-    Returns:
-        List[List[str]]: Filtered list of QA pairs where verification status was not '0'.
-    """
+def remove_zero_entries(parsed_data, zero_values_data):
+    """Removes entries from parsed_data based on '0' values in zero_values_data."""
     filtered_data = []
     merged_zero_values = merge_results(zero_values_data)
     lines = merged_zero_values.strip().split('\n')
@@ -157,36 +127,20 @@ def remove_zero_entries(parsed_data: List[List[str]], zero_values_data: List[str
 
     for entry in parsed_data:
         qa_number = entry[0].strip('"')
-        # Only include if status is not '0' (i.e., '1' or missing, assuming missing means valid)
         if verification_status.get(qa_number) != "0":
             filtered_data.append(entry)
     return filtered_data
 
-def parse_and_filter_distractors_list(input_string: str) -> List[str]:
-    """
-    Parses a string of distractors into a list of strings.
-    Expected input: '"d1"\n"d2"\n...'
-
-    Args:
-        input_string (str): A string containing distractors, one per line, quoted.
-
-    Returns:
-        List[str]: A list of parsed distractor strings.
-    """
+def parse_and_filter_distractors_list(input_string):
+    """Parses a string of distractors into a list."""
     lines = input_string.strip().split('\n')
     distractors = [line.strip('"') for line in lines]
     return distractors
 
-def extract_list_within_balanced_brackets(input_string: str) -> Optional[List]:
+def extract_list_within_balanced_brackets(input_string):
     """
-    Extracts and safely evaluates the list within the outermost balanced square brackets
-    from a given string. Handles incomplete or unbalanced structures.
-
-    Args:
-        input_string (str): The string potentially containing a list.
-
-    Returns:
-        Optional[List]: The extracted Python list, or None if no valid list is found/parsed.
+    Extracts the list within the outermost balanced square brackets.
+    Handles incomplete or unbalanced structures and returns a list.
     """
     start_index = input_string.find("[")
     if start_index == -1:
@@ -209,28 +163,16 @@ def extract_list_within_balanced_brackets(input_string: str) -> Optional[List]:
     extracted_string = input_string[start_index : end_index+1]
 
     try:
-        # ast.literal_eval is safer than eval() for evaluating string literals
         extracted_list = ast.literal_eval(extracted_string)
         return extracted_list
     except (SyntaxError, ValueError) as e:
-        st.error(f"Error evaluating string as a list in extract_list_within_balanced_brackets: {e}")
+        st.error(f"Error evaluating string as a list: {e}")
         return None
 
-def parse_input(input_data: List[str]) -> List[List]:
-    """
-    Parses a list of strings, each expected to contain a list-like structure,
-    into a list of Python lists.
-    This is used to parse the raw distractor outputs from LLMs.
-
-    Args:
-        input_data (List[str]): A list of strings, each potentially containing a list.
-
-    Returns:
-        List[List]: A list of parsed Python lists.
-    """
+def parse_input(input_data):
+    """Function to extract and parse the first valid list from each input string"""
     parsed_data = []
     for item in input_data:
-        # Use regex to find the entire JSON-like structure
         match = re.search(r"\[.*\]", item, re.DOTALL)
         if match:
             list_str = match.group(0)
@@ -239,22 +181,11 @@ def parse_input(input_data: List[str]) -> List[List]:
                 if isinstance(parsed_list, list):
                     parsed_data.append(parsed_list)
             except (SyntaxError, ValueError):
-                # print(f"Could not parse list string: {list_str}") # Debugging
                 continue
     return parsed_data
 
-def merge_and_select(parsed_data: List[List]) -> List[List]:
-    """
-    Merges multiple lists of distractors (grouped by category) and selects the top 3
-    most frequent distractors for each category.
-
-    Args:
-        parsed_data (List[List]): A list of lists, where each inner list is
-                                  [category, [item1, item2, ...]].
-
-    Returns:
-        List[List]: A list where each inner list is [category, [top_3_distractors]].
-    """
+def merge_and_select(parsed_data):
+    """Function to merge and select items"""
     merged = defaultdict(list)
     for data_list in parsed_data:
         for category, items in data_list:
@@ -265,49 +196,27 @@ def merge_and_select(parsed_data: List[List]) -> List[List]:
         frequency = {}
         for item in items:
             frequency[item] = frequency.get(item, 0) + 1
-        # Sort by frequency in descending order, then alphabetically for ties
         sorted_items = sorted(frequency.keys(), key=lambda x: (-frequency[x], x))
-        selected_items = sorted_items[:3] # Select top 3
+        selected_items = sorted_items[:3]
         result.append([category, selected_items])
 
     return result
 
-def parse_inputs(qa_pairs_data: List[List[str]], distractors_data: List[List[str]]) -> Tuple[dict, dict]:
-    """
-    Parses QA pairs and distractor data into structured dictionaries.
-
-    Args:
-        qa_pairs_data (List[List[str]]): List of QA pairs from `parse_qa`.
-        distractors_data (List[List[str]]): List of selected distractors from `merge_and_select`.
-
-    Returns:
-        Tuple[dict, dict]: A tuple containing two dictionaries:
-                          - parsed_qa: {category: {"question": str, "correct_answer": str}}
-                          - parsed_distractors: {category: List[str]}
-    """
+def parse_inputs(qa_pairs, distractors):
+    """Function to parse QA pairs and distractors"""
     parsed_qa = {}
-    for item in qa_pairs_data:
-        # item is like ['"1"', '"What is X?"', '"Y"']
+    for item in qa_pairs:
         category = item[0].strip('"')
         question = item[1].strip('"')
         correct_answer = item[2].strip('"')
         parsed_qa[category] = {"question": question, "correct_answer": correct_answer}
 
-    parsed_distractors = {category: items for category, items in distractors_data}
+    parsed_distractors = {category: items for category, items in distractors}
 
     return parsed_qa, parsed_distractors
 
-def merge_mcqs(parsed_qa: dict, parsed_distractors: dict) -> List[dict]:
-    """
-    Merges parsed QA pairs with selected distractors to form complete MCQ structures.
-
-    Args:
-        parsed_qa (dict): Dictionary of QA pairs.
-        parsed_distractors (dict): Dictionary of distractors.
-
-    Returns:
-        List[dict]: A list of dictionaries, each representing a complete MCQ.
-    """
+def merge_mcqs(parsed_qa, parsed_distractors):
+    """Function to merge QA pairs with distractors"""
     final_mcqs = []
 
     for category, qa in parsed_qa.items():
@@ -315,24 +224,21 @@ def merge_mcqs(parsed_qa: dict, parsed_distractors: dict) -> List[dict]:
         correct_answer = qa["correct_answer"]
         options = parsed_distractors.get(category, [])
 
-        options_for_mcq = list(options) # Create a copy to avoid modifying original list
+        options_for_mcq = list(options)
         options_for_mcq.append(correct_answer)
         random.shuffle(options_for_mcq)
 
-        # Ensure there are exactly 4 options by padding with correct answer if needed
         while len(options_for_mcq) < 4:
             options_for_mcq.append(correct_answer)
             random.shuffle(options_for_mcq)
 
-        # Trim to exactly 4 options if more were generated (shouldn't happen with current logic)
         options_for_mcq = options_for_mcq[:4]
 
-        # Determine the correct option (A, B, C, or D)
         try:
             correct_option_letter = chr(65 + options_for_mcq.index(correct_answer))
         except ValueError:
-            st.warning(f"Correct answer '{correct_answer}' not found in options for category {category}. Setting correct option to A as a fallback.")
-            correct_option_letter = 'A' # Fallback if correct answer somehow isn't in options
+            st.warning(f"Correct answer '{correct_answer}' not found in options for category {category}. Setting correct option to A.")
+            correct_option_letter = 'A'
 
         final_mcqs.append({
             "category": category,
@@ -343,20 +249,9 @@ def merge_mcqs(parsed_qa: dict, parsed_distractors: dict) -> List[dict]:
 
     return final_mcqs
 
-# --- mcq_pipeline.py (Separate file for core MCQ generation logic) ---
+# MCQs Generation Pipeline Implementations
 
-def generate_qa_pairs(topic: str, count: int, difficulty: str) -> Optional[str]:
-    """
-    Generates Question and Answer pairs using the Gemini API.
-
-    Args:
-        topic (str): The subject topic for the QA pairs.
-        count (int): The number of QA pairs to generate.
-        difficulty (str): The desired difficulty level.
-
-    Returns:
-        Optional[str]: A string of generated QA pairs in CSV-like format, or None on failure.
-    """
+def generate_qa_pairs(topic: str, count: int, difficulty: str):
     prompt = f'''
     Generate {count} Question and Answer pairs on the topic of "{topic}" following these guidelines:
     1. Maintain a difficulty level of {difficulty}.
@@ -371,17 +266,17 @@ def generate_qa_pairs(topic: str, count: int, difficulty: str) -> Optional[str]:
     9. Verify that each question has only one correct and unambiguous answer.
     10. Align questions with Bloom's Taxonomy levels based on the difficulty:
             - Remembering (Basic): Focus on recall of facts, terms, or concepts. Example: "What is the capital of France?"
-              - MCQ Example: "What is the chemical symbol for Gold? A) Ag B) Au C) Fe D) Pb"
+            - MCQ Example: "What is the chemical symbol for Gold? A) Ag B) Au C) Fe D) Pb"
             - Understanding (Intermediate): Test comprehension of ideas or concepts. Example: "Which of the following best describes Newton's First Law?"
-              - MCQ Example: "Which law states that an object in motion stays in motion unless acted upon by an external force? A) Newton's First Law B) Newton's Second Law C) Newton's Third Law D) Law of Gravitation"
+            - MCQ Example: "Which law states that an object in motion stays in motion unless acted upon by an external force? A) Newton's First Law B) Newton's Second Law C) Newton's Third Law D) Law of Gravitation"
             - Applying (Intermediate): Use knowledge in new situations. Example: "If a force of 10N is applied to a 2kg object, what is its acceleration?"
-              - MCQ Example: "What is the acceleration of a 5kg object when a 20N force is applied? A) 2 m/s² B) 4 m/s² C) 5 m/s² D) 10 m/s²"
+            - MCQ Example: "What is the acceleration of a 5kg object when a 20N force is applied? A) 2 m/s² B) 4 m/s² C) 5 m/s² D) 10 m/s²"
             - Analyzing (Advanced): Break down information into parts and explore relationships. Example: "Which of the following processes is responsible for genetic diversity in meiosis?"
-              - MCQ Example: "Which process during meiosis contributes to genetic variation? A) Crossing over B) DNA replication C) Cytokinesis D) Mitosis"
+            - MCQ Example: "Which process during meiosis contributes to genetic variation? A) Crossing over B) DNA replication C) Cytokinesis D) Mitosis"
             - Evaluating (Advanced): Make judgments based on criteria and standards. Example: "Which theory best explains the observed phenomenon, and why?"
-              - MCQ Example: "Which theory best explains the behavior of gases at high temperatures? A) Kinetic Theory B) Boyle's Law C) Charles's Law D) Ideal Gas Law"
+            - MCQ Example: "Which theory best explains the behavior of gases at high temperatures? A) Kinetic Theory B) Boyle's Law C) Charles's Law D) Ideal Gas Law"
             - Creating (Advanced): Produce new or original work. Example: "Design an experiment to test the effect of light on plant growth."
-              - MCQ Example: "Which experimental setup would best test the effect of light intensity on plant growth? A) Varying light intensity with constant temperature B) Varying temperature with constant light intensity C) Using different soil types with constant light D) Changing water levels with constant light"
+            - MCQ Example: "Which experimental setup would best test the effect of light intensity on plant growth? A) Varying light intensity with constant temperature B) Varying temperature with constant light intensity C) Using different soil types with constant light D) Changing water levels with constant light"
     11. Do not include any extra text, explanations, or deviations from the specified format.
 
     Output Format:
@@ -390,23 +285,13 @@ def generate_qa_pairs(topic: str, count: int, difficulty: str) -> Optional[str]:
 
     Do not include any additional text or commentary in the output.'''
 
-    response = call_gemini(prompt, "gemini-2.0-flash")
-    return response
+    response = call_gemini(prompt, "gemini-1.5-flash") # Changed to gemini-1.5-flash as per original reference
+    return response if response else None
 
-def verify_qa_pairs(qa_csv: str, count: int, difficulty: str) -> Optional[List[str]]:
-    """
-    Verifies the quality of generated QA pairs using the Gemini API.
 
-    Args:
-        qa_csv (str): A string containing the QA pairs in CSV-like format.
-        count (int): The number of QA pairs being verified.
-        difficulty (str): The difficulty level of the QA pairs.
-
-    Returns:
-        Optional[List[str]]: A list of verification results (e.g., ['"1","1"']), or None on failure.
-    """
+def verify_qa_pairs(qa_csv, count, difficulty):
     verification_prompt = f'''
-    Verify the following {count} QA pairs with dificulty level of {difficulty} and output 0 or 1 for each pair based on the criteria below:
+        Verify the following {count} QA pairs with dificulty level of {difficulty} and output 0 or 1 for each pair based on the criteria below:
     {qa_csv}
 
     Verification Criteria:
@@ -432,10 +317,23 @@ def verify_qa_pairs(qa_csv: str, count: int, difficulty: str) -> Optional[List[s
 
     Important Note: Do not include any additional text like "Here is the output:\n", explanations, or deviations from the specified format.
     '''
+
+    models = [
+        ("gemini", "gemini-2.0-flash"),
+        ("groq", "llama3-70b-8192"),
+        ("mistral", "open-mistral-nemo")
+    ]
+
     results = []
-    # Using ThreadPoolExecutor for potential future parallel calls, currently single call
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [executor.submit(call_gemini, verification_prompt, "gemini-2.0-flash")]
+        futures = []
+        for service, model in models:
+            if service == "gemini":
+                futures.append(executor.submit(call_gemini, verification_prompt, model))
+            elif service == "groq":
+                futures.append(executor.submit(call_groq, verification_prompt, model))
+            elif service == "mistral":
+                futures.append(executor.submit(call_mistral, verification_prompt, model))
 
         for future in concurrent.futures.as_completed(futures):
             try:
@@ -443,31 +341,15 @@ def verify_qa_pairs(qa_csv: str, count: int, difficulty: str) -> Optional[List[s
                 if result:
                     results.append(result)
             except Exception as e:
-                st.error(f"Verification step error: {e}")
+                st.error(f"Verification error: {e}")
+
     return results if results else None
 
-def generate_distractors(qa_csv: List[List[str]], difficulty: str) -> Optional[str]:
-    """
-    Generates a list of plausible but incorrect distractors for given QA pairs.
-
-    Args:
-        qa_csv (List[List[str]]): The list of QA pairs (e.g., [['"1"', '"Q1"', '"A1"']]).
-        difficulty (str): The desired difficulty level for distractors.
-
-    Returns:
-        Optional[str]: A string containing the generated distractors in a list-of-lists format,
-                       or None on failure.
-    """
-    # Convert list of lists to the expected string format for the prompt
-    formatted_qa_pairs = ""
-    for qa_pair in qa_csv:
-        # Assuming qa_pair is ['"1"', '"Question"', '"Answer"']
-        formatted_qa_pairs += f'{qa_pair[0]}, {qa_pair[1]}, {qa_pair[2]}\n'
-
+def generate_distractors(qa_csv: str, difficulty: str):
     distractors_prompt = f'''
     Generate 10 high-quality plausible but incorrect distractors with difficulty level of {difficulty} for the given list of QA pairs (number, question, answer) following provided guidelines:
     QA Pairs:
-    {formatted_qa_pairs.strip()}
+    {qa_csv}
 
     Guidelines:
     1. Each option should seem like a valid answer.
@@ -487,35 +369,17 @@ def generate_distractors(qa_csv: List[List[str]], difficulty: str) -> Optional[s
     Do not include any additional text, explanations, or deviations from the specified format.
     '''
 
-    response = call_gemini(distractors_prompt, "gemini-2.0-flash")
-    return response
+    response = call_gemini(distractors_prompt, "gemini-2.0-flash-thinking-exp-01-21") # Using gemini-2.0-flash-thinking-exp-01-21 as per original reference
+    return response if response else None
 
-def get_final_distractors(qa_csv_data: List[List[str]], distractors_raw_data: List[List], difficulty: str) -> Optional[List[List]]:
-    """
-    Selects the best 3 distractors from a larger list of generated distractors for each QA pair.
-
-    Args:
-        qa_csv_data (List[List[str]]): The list of QA pairs.
-        distractors_raw_data (List[List]): The raw list of 10 distractors per category.
-        difficulty (str): The difficulty level.
-
-    Returns:
-        Optional[List[List]]: A list of lists, where each inner list contains
-                              [category, [selected_distractor1, selected_distractor2, selected_distractor3]],
-                              or None on failure.
-    """
-    # Convert list of lists to the expected string format for the prompt
-    formatted_qa_pairs = ""
-    for qa_pair in qa_csv_data:
-        formatted_qa_pairs += f'{qa_pair[0]}, {qa_pair[1]}, {qa_pair[2]}\n'
-
+def get_final_distractors(qa_csv: str, distractors_csv, difficulty: str):
     final_distractors_prompt = f'''
     Based on the provided QA Pairs, select the best high-quality distractors from the list of distractors considering the dificulty level of {difficulty} given below:
     QA Pairs:
-    {formatted_qa_pairs.strip()}
+    {qa_csv}
 
     Distractors:
-    {json.dumps(distractors_raw_data, indent=2)}
+    {distractors_csv}
 
     Output Rules:
     1. Select 3 distractors for each QA pair.
@@ -531,9 +395,22 @@ def get_final_distractors(qa_csv_data: List[List[str]], distractors_raw_data: Li
     The output must start with `[` and end with `]`.
     Do not include any additional text, explanations, or deviations from the specified format.
     '''
+    models = [
+        ("gemini", "gemini-1.5-flash"),
+        ("groq", "llama3-70b-8192"),
+        ("mistral", "open-mistral-nemo")
+    ]
+
     results = []
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [executor.submit(call_gemini, final_distractors_prompt, "gemini-2.0-flash")]
+        futures = []
+        for service, model in models:
+            if service == "gemini":
+                futures.append(executor.submit(call_gemini, final_distractors_prompt, model))
+            elif service == "groq":
+                futures.append(executor.submit(call_groq, final_distractors_prompt, model))
+            elif service == "mistral":
+                futures.append(executor.submit(call_mistral, final_distractors_prompt, model))
 
         for future in concurrent.futures.as_completed(futures):
             try:
@@ -541,25 +418,22 @@ def get_final_distractors(qa_csv_data: List[List[str]], distractors_raw_data: Li
                 if result:
                     results.append(result)
             except Exception as e:
-                st.error(f"Final distractor selection error: {e}")
+                st.error(f"Distractor selection error: {e}")
 
-    # Parse the input
     parsed_data = parse_input(results)
-
-    # Merge and select items
     final_result = merge_and_select(parsed_data)
-    return final_result
+    return final_result if final_result else None
+
+class MCQs(BaseModel):
+    category: str
+    question: str
+    options: List[str]
+    correct_option: str
+
 
 def optimize_mcqs(all_mcqs: List[dict], difficulty: str) -> Optional[List[MCQs]]:
     """
-    Optimizes a list of MCQs using the Gemini API with a structured JSON response.
-
-    Args:
-        all_mcqs (List[dict]): A list of compiled MCQs in dictionary format.
-        difficulty (str): The difficulty level to consider during optimization.
-
-    Returns:
-        Optional[List[MCQs]]: A list of optimized MCQs as Pydantic models, or None on failure.
+    Optimizes a list of MCQs using Gemini API with structured response.
     """
     optimization_prompt = f'''
     Review and optimize the following list of MCQs keeping difficulty level of {difficulty} to ensure they meet the criteria below. Output the refined MCQs in a structured JSON format.
@@ -579,7 +453,8 @@ def optimize_mcqs(all_mcqs: List[dict], difficulty: str) -> Optional[List[MCQs]]
     Optimize only where necessary; avoid over-optimization.
     '''
 
-    client = gemini.GenerativeModel(model_name='gemini-2.0-flash')
+    # Corrected client initialization and API call for structured output
+    model_instance = gemini.GenerativeModel(model_name='gemini-2.0-flash')
 
     # Define the response schema explicitly for a list of MCQs
     mcqs_list_schema = {
@@ -600,53 +475,36 @@ def optimize_mcqs(all_mcqs: List[dict], difficulty: str) -> Optional[List[MCQs]]
     }
 
     try:
-        response = client.generate_content(
+        response = model_instance.generate_content(
             contents=optimization_prompt,
             generation_config={
                 'response_mime_type': 'application/json',
                 'response_schema': mcqs_list_schema,
             },
         )
+        # Parse the JSON string from response.text and validate with Pydantic
         generated_json_str = response.text
         parsed_data = json.loads(generated_json_str)
-        # Validate the parsed JSON against the Pydantic model
         generated_mcqs: List[MCQs] = TypeAdapter(List[MCQs]).validate_python(parsed_data)
         return generated_mcqs
     except Exception as e:
         st.error(f"MCQ optimization failed: {e}")
         return None
 
+
 def compile_mcqs(filtered_output: List[List[str]], final_result: List[List[str]]) -> List[dict]:
-    """
-    Compiles the final MCQs from filtered QA pairs and selected distractors.
-
-    Args:
-        filtered_output (List[List[str]]): The list of verified and filtered QA pairs.
-        final_result (List[List[str]]): The list of selected distractors for each category.
-
-    Returns:
-        List[dict]: A list of compiled MCQs in dictionary format.
-    """
+    """Compiles the final MCQs from filtered QA pairs and selected distractors."""
     parsed_qa, parsed_distractors = parse_inputs(filtered_output, final_result)
     final_mcqs = merge_mcqs(parsed_qa, parsed_distractors)
     return final_mcqs
 
+
 def generate_mcqs(topic: str, count: int, difficulty: str) -> Optional[List[MCQs]]:
     """
-    Orchestrates the entire MCQ generation pipeline, including QA generation,
-    verification, distractor generation, selection, compilation, and optimization.
-
-    Args:
-        topic (str): The topic for the MCQs.
-        count (int): The desired number of MCQs.
-        difficulty (str): The difficulty level for the MCQs.
-
-    Returns:
-        Optional[List[MCQs]]: A list of optimized MCQs as Pydantic models, or None if any step fails.
+    Orchestrates the MCQ generation pipeline.
     """
     st.subheader("Generation Steps:")
 
-    # Step 1: Generate QA Pairs
     with st.spinner("Generating QA Pairs..."):
         qa_pairs = generate_qa_pairs(topic, count, difficulty)
         if not qa_pairs:
@@ -654,12 +512,11 @@ def generate_mcqs(topic: str, count: int, difficulty: str) -> Optional[List[MCQs
             return None
         st.success("QA Pairs Generated.")
 
-    # Step 2: Verify QA Pairs
     with st.spinner("Verifying QA Pairs..."):
         verification_results = verify_qa_pairs(qa_pairs, count, difficulty)
         if not verification_results:
             st.warning("Failed to verify QA pairs or no verification data returned. Proceeding with caution.")
-            parsed_qa_pairs = parse_qa(qa_pairs) # Still parse even if no verification
+            parsed_qa_pairs = parse_qa(qa_pairs)
             filtered_output = parsed_qa_pairs
         else:
             parsed_qa_pairs = parse_qa(qa_pairs)
@@ -670,7 +527,6 @@ def generate_mcqs(topic: str, count: int, difficulty: str) -> Optional[List[MCQs
             return None
         st.success(f"{len(filtered_output)} QA Pairs Verified and Filtered.")
 
-    # Step 3: Generate Distractors
     with st.spinner("Generating Distractors..."):
         distractors_raw = generate_distractors(filtered_output, difficulty)
         if not distractors_raw:
@@ -682,7 +538,6 @@ def generate_mcqs(topic: str, count: int, difficulty: str) -> Optional[List[MCQs
             return None
         st.success("Distractors Generated.")
 
-    # Step 4: Select Final Distractors
     with st.spinner("Selecting Final Distractors..."):
         final_distractors = get_final_distractors(filtered_output, cleaned_distractors, difficulty)
         if not final_distractors:
@@ -690,7 +545,6 @@ def generate_mcqs(topic: str, count: int, difficulty: str) -> Optional[List[MCQs
             return None
         st.success("Final Distractors Selected.")
 
-    # Step 5: Compile MCQs
     with st.spinner("Compiling MCQs..."):
         all_mcqs = compile_mcqs(filtered_output, final_distractors)
         if not all_mcqs:
@@ -698,32 +552,18 @@ def generate_mcqs(topic: str, count: int, difficulty: str) -> Optional[List[MCQs
             return None
         st.success("MCQs Compiled.")
 
-    # Step 6: Optimize MCQs
     with st.spinner("Optimizing MCQs..."):
         final_optimized_mcqs = optimize_mcqs(all_mcqs, difficulty)
         if not final_optimized_mcqs:
             st.error("Failed to optimize MCQs. Displaying unoptimized MCQs if available.")
-            return None # Return None if optimization fails
+            return None
         st.success("MCQs Optimized!")
 
     return final_optimized_mcqs
 
-# --- app.py (Continued - UI and Display Functions) ---
-
 def view_mcqs_expanded(final_mcqs: List[MCQs], topic: str, difficulty: str):
-    """
-    Displays MCQs in an expanded, readable format within the Streamlit UI.
-
-    Args:
-        final_mcqs (List[MCQs]): A list of optimized MCQs (Pydantic models).
-        topic (str): The topic of the MCQs.
-        difficulty (str): The difficulty level of the MCQs.
-    """
+    """Displays MCQs in an expanded, readable format."""
     st.header("Generated MCQs")
-    if not final_mcqs:
-        st.info("No MCQs to display. Please generate them first.")
-        return
-
     for i, mcq in enumerate(final_mcqs):
         st.markdown(f"---")
         st.subheader(f"Question {i+1} (Category: {mcq.category})")
@@ -735,40 +575,26 @@ def view_mcqs_expanded(final_mcqs: List[MCQs], topic: str, difficulty: str):
         st.write(f"**Difficulty**: {difficulty}")
 
 def view_mcqs_csv(final_mcqs: List[MCQs], domain: str, topic: str, difficulty: str) -> str:
-    """
-    Generates a CSV formatted string of the MCQs.
-
-    Args:
-        final_mcqs (List[MCQs]): A list of optimized MCQs (Pydantic models).
-        domain (str): The domain of the MCQs.
-        topic (str): The topic of the MCQs.
-        difficulty (str): The difficulty level of the MCQs.
-
-    Returns:
-        str: A string containing the MCQs in CSV format.
-    """
+    """Returns MCQs in CSV format as a string."""
     csv_output = ""
-    # Header for CSV
     csv_output += '"Domain","Topic","Question","Option A","Option B","Option C","Option D","Correct Option","Difficulty"\n'
     for mcqs_item in final_mcqs:
         options_str = ""
-        # Ensure there are always 4 options for CSV consistency
-        # Pad with empty strings if less than 4 options (though typically 4 are generated)
         padded_options = list(mcqs_item.options) + [""] * (4 - len(mcqs_item.options))
-        for option in padded_options[:4]: # Take only first 4 options
-            options_str += f'"{option}",'
-        options_str = options_str.rstrip(',') # Remove trailing comma
+        for option in padded_options[:4]:
+            options_str += f'"{option.replace('"', '""')}",' # Escape double quotes within options
+        options_str = options_str.rstrip(',')
 
-        csv_output += f'''"{domain}","{topic}","{mcqs_item.question}",{options_str},"{mcqs_item.correct_option}","{difficulty}"\n'''
+        csv_output += f'''"{domain.replace('"', '""')}","{topic.replace('"', '""')}","{mcqs_item.question.replace('"', '""')}",{options_str},"{mcqs_item.correct_option.replace('"', '""')}","{difficulty.replace('"', '""')}"\n'''
     return csv_output
 
-# --- Streamlit UI Layout ---
+# Streamlit UI
 st.set_page_config(page_title="MCQ Generator", layout="centered")
 
 st.title("🧠 MCQsAgent")
 st.markdown("Generate multiple-choice questions on any topic with custom difficulty levels.")
 
-# Input fields in the sidebar
+# Input fields
 with st.sidebar:
     st.header("Configuration")
     domain = st.text_input("Domain (e.g., Programming, Science)", "Programming")
@@ -783,28 +609,27 @@ if st.button("Generate MCQs"):
         st.error("Please enter a topic.")
     else:
         st.info("Generating MCQs, this might take a moment...")
-        # Call the main generation pipeline
         final_mcqs_data = generate_mcqs(topic, num_mcqs, difficulty)
 
         if final_mcqs_data:
             st.success("MCQ generation complete!")
 
-            # Display expanded view of MCQs
-            view_mcqs_expanded(final_mcqs_data, topic, difficulty)
+            display_format = st.radio("Choose Display Format:", ("Expanded View", "CSV Format"))
 
-            st.markdown("---")
-            st.subheader("MCQs in CSV Format")
-            # Generate CSV output
-            csv_output = view_mcqs_csv(final_mcqs_data, domain, topic, difficulty)
-            st.text_area("CSV Output", csv_output, height=300)
+            if display_format == "Expanded View":
+                view_mcqs_expanded(final_mcqs_data, topic, difficulty)
+            else:
+                csv_output = view_mcqs_csv(final_mcqs_data, domain, topic, difficulty)
+                st.text_area("CSV Output", csv_output, height=300)
 
-            # Provide download button for CSV
-            st.download_button(
-                label="Download MCQs as CSV",
-                data=csv_output,
-                file_name=f"mcqs_{topic.replace(' ', '_').lower()}_{difficulty.lower()}.csv",
-                mime="text/csv",
-            )
+                st.download_button(
+                    label="Download MCQs as CSV",
+                    data=csv_output,
+                    file_name=f"mcqs_{topic.replace(' ', '_').lower()}_{difficulty.replace(' ', '_').lower()}.csv",
+                    mime="text/csv",
+                )
         else:
-            st.error("Failed to generate MCQs. Please review the errors above or try different parameters.")
+            st.error("MCQ generation failed. Please check the logs for details or try again with different parameters.")
 
+st.markdown("---")
+st.markdown("Developed using Google's Gemini API, Mistral API, and Groq API.")
