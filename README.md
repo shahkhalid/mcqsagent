@@ -134,25 +134,35 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Set Up Your API Keys
+## 🔐 API Key Configuration
 
-Access to **Google Gemini**, **Groq**, and **Mistral AI APIs** is required.
+This app requires valid API keys from **Google Gemini**, **Groq**, and **Mistral AI**. These should be stored securely using Streamlit's `secrets.toml`.
 
-- **Google Gemini**: [Google AI Studio](https://aistudio.google.com/)
-- **Groq**: [Groq Console](https://console.groq.com/)
-- **Mistral AI**: [Mistral AI Platform](https://mistral.ai/)
+### Steps:
 
-Create a `.env` file in the root directory:
+1. In your project root directory, create a folder named `.streamlit`.
+2. Inside it, create a file called `secrets.toml`.
+3. Add your keys like this:
 
-```bash
-GEMINI_API_KEY="YOUR_GEMINI_API_KEY_HERE"
-GROQ_API_KEY="YOUR_GROQ_API_KEY_HERE"
-MISTRAL_API_KEY="YOUR_MISTRAL_API_KEY_HERE"
+```toml
+GROQ_API_KEY = "your_groq_api_key_here"
+MISTRAL_API_KEY = "your_mistral_api_key_here"
+GEMINI_API_KEY = "your_gemini_api_key_here"
 ```
 
-> ⚠️ Replace placeholders with your actual keys. Do **not commit** this file to version control.
+> ⚠️ Never share or commit this file publicly. Add it to your `.gitignore`.
 
-Add `.env` to your `.gitignore`.
+### How to Get Your Keys:
+
+| Service | Link |
+|--------|------|
+| **Google Gemini** | [Get API Key](https://aistudio.google.com/app/apikey) |
+| **Groq** | [Manage API Keys](https://console.groq.com/keys) |
+| **Mistral AI** | [API Keys Console](https://console.mistral.ai/api-keys/) |
+
+> You must have appropriate access permissions (e.g., developer role) to manage API keys.
+
+---
 
 ### 5. Run the Application
 
